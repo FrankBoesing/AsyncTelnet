@@ -1,0 +1,23 @@
+{
+  "name": "AsyncTelnet",
+  "version": "1.1.0",
+  "description": "Lightweight, non-blocking Telnet server for ESP32.",
+  "keywords": "telnet, async, logging, esp32, network",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FrankBoesing/AsyncTelnet.git"
+  },
+  "authors": [
+    {
+      "name": "Frank Bösing",
+      "maintainer": true
+    }
+  ],
+  "frameworks": "arduino",
+  "platforms": ["espressif32"],
+  "libdeps": {
+    "espressif32": [
+      "ESP32Async/AsyncTCP"
+    ]
+  }
+}
