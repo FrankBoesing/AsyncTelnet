@@ -20,95 +20,97 @@ bool AsyncTelnet::begin(bool checkConnection)
                 return;
 
             /*
-             * Prüfen, ob bereits ein Client vorhanden ist.
-             *
-             * Der Mutex wird nur für den Zugriff auf den Pointer
-             * gehalten, niemals während close().
+             * Nur einen Client gleichzeitig zulassen.
              */
-            AsyncClient *oldClient = nullptr;
-
+            if (client != nullptr)
             {
-                std::lock_guard<std::mutex> lock(mutex);
-
-                if (client != nullptr)
+                if (client->connected())
                 {
-                    if (client->connected())
-                    {
-                        // Bereits ein aktiver Client vorhanden:
-                        // neuer Client wird abgewiesen.
-                        c->close();
-                        delete c;
-                        return;
-                    }
-
-                    // Alter Client ist nicht mehr verbunden.
-                    // Er wird außerhalb des Mutex geschlossen.
-                    oldClient = client;
-                    client = nullptr;
+                    /*
+                     * Für den abgewiesenen Client wurde noch kein
+                     * Disconnect-Callback registriert.
+                     *
+                     * close() löst deshalb keinen Benutzer-Callback aus.
+                     */
+                    c->close();
+                    delete c;
+                    return;
                 }
+
+                /*
+                 * Der alte Client ist bereits nicht mehr verbunden.
+                 *
+                 * close() sorgt dafür, dass eventuell noch ausstehende
+                 * AsyncTCP-Events entfernt werden und der Disconnect-
+                 * Callback ausgelöst wird.
+                 */
+                AsyncClient *old = client;
+                client = nullptr;
+
+                old->close();
+
+                /*
+                 * old darf hier NICHT mehr verwendet werden.
+                 */
             }
 
             /*
-             * Falls noch ein alter, bereits getrennter Client
-             * vorhanden war, sauber schließen.
-             *
-             * Der Disconnect-Callback übernimmt anschließend
-             * delete oldClient.
+             * Client übernehmen.
              */
-            if (oldClient != nullptr)
-            {
-                oldClient->close();
-            }
+            client = c;
+            ip = c->remoteIP();
+
+#if HANDLE_INCOMMING_DATA
+            buf_ptr = 0;
+#endif
 
             /*
-             * Client konfigurieren, BEVOR onConnect() aufgerufen wird.
-             *
-             * Das ist wichtig:
-             * onConnect() darf disconnectClient()/close() aufrufen.
-             * Danach darf hier nicht mehr auf c zugegriffen werden.
+             * Disconnect-Callback.
              */
-            c->setNoDelay(true);
-
             c->onDisconnect(
                 [this](void *, AsyncClient *cl)
                 {
-                    DisconnHandler callback;
-
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-
-                        if (client == cl)
-                            client = nullptr;
-
-                        callback = on_disconnect;
-                    }
-
                     /*
-                     * Kein Mutex während des Benutzer-Callbacks.
-                     * Der Benutzer darf hier write(), connected(),
-                     * disconnectClient() usw. aufrufen.
+                     * Erst unseren Pointer löschen.
                      */
-                    if (callback)
-                        callback(cl);
+                    if (client == cl)
+                        client = nullptr;
 
                     /*
-                     * AsyncTCP erzeugt den Client mit new.
-                     * Nach Disconnect muss er gelöscht werden.
+                     * Benutzer informieren.
+                     */
+                    if (on_disconnect)
+                        on_disconnect(cl);
+
+                    /*
+                     * AsyncServer erzeugt den Client mit new.
+                     *
+                     * AsyncTCP übernimmt NICHT das delete nach
+                     * unserem Disconnect-Callback.
                      */
                     delete cl;
                 },
                 this);
 
+            /*
+             * Fehler-Callback.
+             *
+             * WICHTIG:
+             * Hier NICHT delete durchführen.
+             *
+             * AsyncTCP ruft nach _error() ebenfalls den
+             * Disconnect-Callback auf.
+             */
             c->onError(
-                [this](void *, AsyncClient *, int8_t)
+                [this](void *, AsyncClient *cl, int8_t)
                 {
                     /*
-                     * AsyncTCP ruft nach onError() anschließend
-                     * onDisconnect() auf.
+                     * Nichts tun.
                      *
-                     * Deshalb hier NICHT delete durchführen und
-                     * den Client-Pointer auch nicht vorzeitig löschen.
+                     * Der anschließende onDisconnect-Callback
+                     * übernimmt die Aufräumarbeit.
                      */
+                    (void)cl;
                 },
                 this);
 
@@ -120,12 +122,12 @@ bool AsyncTelnet::begin(bool checkConnection)
                     if (data == nullptr || len == 0)
                         return;
 
-                    const char *input =
+                    const char *p =
                         static_cast<const char *>(data);
 
                     for (size_t i = 0; i < len; ++i)
                     {
-                        const char incoming = input[i];
+                        char incoming = p[i];
 
                         /*
                          * CR aus CRLF ignorieren.
@@ -134,32 +136,22 @@ bool AsyncTelnet::begin(bool checkConnection)
                             continue;
 
                         /*
-                         * LF beendet eine Zeile.
+                         * LF beendet die Zeile.
                          */
                         if (incoming == '\n')
                         {
-                            IncomingDataHandler callback;
+                            buffer[buf_ptr] = '\0';
 
-                            {
-                                std::lock_guard<std::mutex> lock(mutex);
+                            if (on_incoming_data)
+                                on_incoming_data(buffer);
 
-                                buffer[buf_ptr] = '\0';
-                                callback = on_incoming_data;
-                                buf_ptr = 0;
-                            }
-
-                            /*
-                             * Callback außerhalb des Mutex.
-                             */
-                            if (callback)
-                                callback(buffer);
+                            buf_ptr = 0;
 
                             continue;
                         }
 
                         /*
-                         * Immer Platz für das abschließende '\0'
-                         * lassen.
+                         * Platz für '\0' lassen.
                          */
                         if (buf_ptr < sizeof(buffer) - 1)
                         {
@@ -172,33 +164,11 @@ bool AsyncTelnet::begin(bool checkConnection)
 #endif
 
             /*
-             * Client jetzt sichtbar machen.
+             * Callback erst aufrufen, wenn der Client vollständig
+             * eingerichtet ist.
              */
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-
-                client = c;
-                ip = c->remoteIP();
-
-#if HANDLE_INCOMMING_DATA
-                buf_ptr = 0;
-#endif
-            }
-
-            /*
-             * Callback erst ganz am Ende.
-             *
-             * Der Callback darf den Client sofort schließen.
-             */
-            ConnHandler callback;
-
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                callback = on_connect;
-            }
-
-            if (callback)
-                callback(nullptr, c);
+            if (on_connect)
+                on_connect(nullptr, c);
         },
         this);
 
@@ -206,65 +176,65 @@ bool AsyncTelnet::begin(bool checkConnection)
 
     /*
      * AsyncServer::begin() liefert void.
-     * status() == 0 bedeutet hier, dass kein Listen-PCB vorhanden ist.
+     *
+     * status() ist nach erfolgreichem Listen != 0.
      */
     return server.status() != 0;
 }
 
 void AsyncTelnet::close()
 {
+    /*
+     * Server zuerst stoppen.
+     */
     server.end();
 
-    AsyncClient *c = nullptr;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        c = client;
-        client = nullptr;
-    }
+    /*
+     * Pointer lokal sichern.
+     */
+    AsyncClient *c = client;
 
     /*
-     * Ganz wichtig:
-     * Mutex NICHT während close() halten.
+     * Sofort aus unserem Zustand entfernen.
      *
-     * AsyncClient::close() kann synchron onDisconnect()
-     * auslösen und der Callback löscht den Client.
+     * Wichtig wegen Reentrancy:
+     * c->close() kann onDisconnect() synchron aufrufen.
      */
+    client = nullptr;
+
     if (c != nullptr)
     {
+        /*
+         * NICHT delete c hier.
+         *
+         * c->close() ruft unseren onDisconnect()-Callback auf,
+         * welcher delete c ausführt.
+         */
         c->close();
     }
 }
 
 bool AsyncTelnet::connected()
 {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    if (client == nullptr)
-        return false;
-
-    return client->connected();
+    return client != nullptr &&
+           client->connected();
 }
 
 void AsyncTelnet::disconnectClient()
 {
-    AsyncClient *c = nullptr;
+    AsyncClient *c = client;
 
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        c = client;
-        client = nullptr;
-    }
+    if (c == nullptr)
+        return;
 
     /*
-     * Nicht unter Mutex schließen.
+     * Pointer vor close() löschen.
+     *
+     * close() kann synchron onDisconnect() auslösen.
      */
-    if (c != nullptr)
-    {
-        c->close();
-    }
+    client = nullptr;
+
+    c->close();
 }
 
 size_t AsyncTelnet::write(const char *data)
@@ -272,16 +242,12 @@ size_t AsyncTelnet::write(const char *data)
     if (data == nullptr)
         return 0;
 
-    std::lock_guard<std::mutex> lock(mutex);
+    AsyncClient *c = client;
 
-    if (client == nullptr || !client->connected())
+    if (c == nullptr || !c->connected())
         return 0;
 
-    /*
-     * AsyncClient::write(const char*) erledigt intern
-     * strlen() sowie add()+send().
-     */
-    return client->write(data);
+    return c->write(data, strlen(data));
 }
 
 size_t AsyncTelnet::write(const char *data,
@@ -291,40 +257,29 @@ size_t AsyncTelnet::write(const char *data,
     if (data == nullptr || size == 0)
         return 0;
 
-    std::lock_guard<std::mutex> lock(mutex);
+    AsyncClient *c = client;
 
-    if (client == nullptr || !client->connected())
+    if (c == nullptr || !c->connected())
         return 0;
 
     /*
-     * AsyncClient::write() übernimmt bereits:
+     * AsyncClient::write() macht intern:
      *
-     *     add()
-     *     send()
+     *   add()
+     *   send()
      *
-     * und liefert die tatsächlich akzeptierte Bytezahl.
+     * und gibt die tatsächlich akzeptierte Bytezahl zurück.
      */
-    return client->write(data, size, apiflags);
-}
-
-IPAddress AsyncTelnet::getLastAttemptIP() const
-{
-    std::lock_guard<std::mutex> lock(mutex);
-
-    return ip;
+    return c->write(data, size, apiflags);
 }
 
 void AsyncTelnet::onConnect(ConnHandler callbackFunc)
 {
-    std::lock_guard<std::mutex> lock(mutex);
-
     on_connect = callbackFunc;
 }
 
 void AsyncTelnet::onDisconnect(DisconnHandler callbackFunc)
 {
-    std::lock_guard<std::mutex> lock(mutex);
-
     on_disconnect = callbackFunc;
 }
 
@@ -332,8 +287,6 @@ void AsyncTelnet::onDisconnect(DisconnHandler callbackFunc)
 
 void AsyncTelnet::onIncomingData(IncomingDataHandler callbackFunc)
 {
-    std::lock_guard<std::mutex> lock(mutex);
-
     on_incoming_data = callbackFunc;
 }
 
